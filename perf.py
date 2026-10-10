@@ -1,10 +1,11 @@
 """
-Performance tracking.
+Performance tracking. Counter-based tick rates. Includes PerfHistory ring buffer.
 """
 
 import time
 import hashlib
 import threading
+from collections import deque
 
 
 def fingerprint(ssid: str) -> str:
@@ -152,3 +153,15 @@ class SlotStats:
                 "slot_tick_rate_60s": round(self.slot_tick_rate_60s, 3),
                 "per_asset": {a: st.snapshot() for a, st in self.asset_stats.items()},
             }
+
+
+class PerfHistory:
+    """Ring buffer of periodic snapshots."""
+    def __init__(self, maxlen=20):
+        self.samples = deque(maxlen=maxlen)
+
+    def append(self, sample: dict):
+        self.samples.append(sample)
+
+    def snapshot(self):
+        return list(self.samples)
