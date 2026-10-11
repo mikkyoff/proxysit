@@ -28,7 +28,7 @@ from seeder import seed_history
 
 
 TIMEFRAME_SECONDS = 10
-MAX_CANDLES = 2400          # allow the full seed to live in memory
+MAX_CANDLES = 100          # allow the full seed to live in memory
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
