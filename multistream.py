@@ -1,34 +1,38 @@
 """
-Multi-SSID streaming manager.
+Multi-SSID streaming manager — boundary-first, history-after.
 
 Flow per slot:
-  1. Connect with optional proxy.
-  2. Seed historical candles via the paged get_candles_advanced walk.
-  3. Subscribe to raw ticks.
-  4. Wait for the next clock boundary (60s-aligned).
-  5. Discard ticks until the boundary.
-  6. Build candles live from that boundary onward.
-  7. Every tick, recompute RSI, BB, EMA and expose them.
+  1. Connect to PocketOption (with optional proxy).
+  2. Subscribe to tick streams immediately.
+  3. Wait for the next clean 60s boundary.
+  4. Discard ticks until the boundary.
+  5. At the boundary:
+       - Flip aligned_started = True.
+       - The next tick is the true open of the live candle.
+       - Spawn a background task to pull 150 closed candles.
+  6. When history arrives, prepend it to the candle buffer and
+     recompute indicators on the combined series.
+  7. Continue building live candles every minute.
 """
 
-import os
 import asyncio
 import threading
 import time
 import random
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from BinaryOptionsToolsV2 import PocketOptionAsync
 from BinaryOptionsToolsV2.config import Config
 
 from indicators import recompute
 from perf import SlotStats, AssetStats
-from seeder import seed_history
 
 
-TIMEFRAME_SECONDS = 10
-MAX_CANDLES = 100          # allow the full seed to live in memory
+TIMEFRAME_SECONDS = 60
+MAX_CANDLES = 500                # enough for 150 seeded + live
+HISTORY_CANDLES = 150            # how many closed candles to pull for seeding
+
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -45,12 +49,12 @@ class AssetState:
         "bb_bandwidth", "bb_pct_to_upper", "bb_pct_to_lower",
         "ema", "ema_signal",
         "aligned_started", "aligned_at",
-        "seeded_count",
+        "history_loaded", "history_count",
     )
 
     def __init__(self, asset: str):
         self.asset = asset
-        self.candles = deque(maxlen=MAX_CANDLES)
+        self.candles = deque(maxlen=MAX_CANDLES)   # tuples (t, o, h, l, c)
         self.forming = None
         self.last_boundary = None
 
@@ -66,14 +70,16 @@ class AssetState:
 
         self.aligned_started = False
         self.aligned_at = None
-        self.seeded_count = 0
+        self.history_loaded = False
+        self.history_count = 0
 
     def snapshot(self):
         return {
             "asset": self.asset,
             "aligned_started": self.aligned_started,
             "aligned_at": self.aligned_at,
-            "seeded_count": self.seeded_count,
+            "history_loaded": self.history_loaded,
+            "history_count": self.history_count,
             "closed_count": len(self.candles),
             "candles": [
                 {"time": t, "open": o, "high": h, "low": l, "close": c}
@@ -139,11 +145,12 @@ class Slot:
             self.stats.mark_error("SSID not set")
             return
 
-        # Build config with proxy if present
         cfg_kwargs = {"timeout_secs": 60, "terminal_logging": False}
         if self.proxy_url:
             cfg_kwargs["proxy"] = self.proxy_url
             print(f"[slot {self.slot_id}] using proxy {self.stats.proxy_endpoint}")
+        else:
+            print(f"[slot {self.slot_id}] running direct")
         config = Config(**cfg_kwargs)
 
         try:
@@ -161,46 +168,21 @@ class Slot:
         )
         self.stats.mark_connected()
 
-        # ---- Seed history for each asset ----
-        for asset in self.assets:
-            try:
-                hist = await seed_history(
-                    client, asset,
-                    timeframe_secs=TIMEFRAME_SECONDS,
-                    total_candles=MAX_CANDLES,
-                    page_size=60,
-                    log_prefix=f"[slot {self.slot_id}]",
-                )
-            except Exception as e:
-                print(f"[slot {self.slot_id}] seed failed for {asset}: {e}")
-                continue
-
-            state = self.asset_state[asset]
-            for c in hist:
-                state.candles.append(c)
-            state.seeded_count = len(hist)
-            if state.candles:
-                state.last_boundary = state.candles[-1][0]
-
-            # Initial indicator calc from history
-            closes = [c[4] for c in state.candles]
-            if closes:
-                self._apply_indicators(state, closes)
-
-        # ---- Wait for the next clock boundary ----
+        # ---- Compute target boundary ----
         target_boundary = self._compute_target_boundary()
         wait_secs = target_boundary - time.time()
-        print(f"[slot {self.slot_id}] waiting {wait_secs:.1f}s for boundary")
+        print(f"[slot {self.slot_id}] waiting {wait_secs:.1f}s for boundary at {int(target_boundary)}")
 
-        # Subscribe to ticks BEFORE the boundary
+        # ---- Subscribe BEFORE the boundary ----
         streams = {}
         for asset in self.assets:
             try:
                 streams[asset] = await client.subscribe_symbol(asset)
             except Exception as e:
                 self.stats.mark_error(f"subscribe {asset}: {e}")
+                print(f"[slot {self.slot_id}] subscribe {asset} failed: {e}")
 
-        # Discard ticks until boundary
+        # ---- Discard ticks until boundary ----
         discard_deadline = target_boundary
 
         async def discard_stream(stream):
@@ -219,12 +201,18 @@ class Slot:
             return_exceptions=True,
         )
 
-        print(f"[slot {self.slot_id}] boundary crossed at {int(time.time())}")
+        # ---- Cross the boundary ----
+        now = int(time.time())
+        print(f"[slot {self.slot_id}] boundary crossed at {now} — starting live build")
         with self.state_lock:
             for st in self.asset_state.values():
                 st.aligned_started = True
-                st.aligned_at = int(time.time())
+                st.aligned_at = now
                 st.forming = None
+
+        # ---- Spawn history fetch in background ----
+        for asset in self.assets:
+            asyncio.create_task(self._fetch_history(client, asset))
 
         # ---- Live ingest ----
         tasks = [
@@ -246,6 +234,106 @@ class Slot:
         if next_boundary - now < MIN_MARGIN_BEFORE_BOUNDARY:
             next_boundary += TIMEFRAME_SECONDS
         return float(next_boundary)
+
+    async def _fetch_history(self, client, asset: str):
+        """
+        Pull the last HISTORY_CANDLES closed candles using the
+        developer's paged walk. Runs in background after the boundary.
+        """
+        state = self.asset_state[asset]
+        log_prefix = f"[slot {self.slot_id}]"
+
+        try:
+            server_time = await client.get_server_time()
+        except Exception as e:
+            print(f"{log_prefix} history {asset}: server time failed: {e}")
+            return
+
+        print(f"{log_prefix} history {asset}: server_time={server_time}")
+
+        total = []
+        page_size = 30
+        pages = (HISTORY_CANDLES + page_size - 1) // page_size
+
+        for i in range(pages):
+            # Walk backward: anchor at server_time, stepping back each page
+            anchor = server_time - (i + 1) * page_size * TIMEFRAME_SECONDS
+            if anchor < 0:
+                break
+            try:
+                page = await client.get_candles_advanced(
+                    asset,
+                    TIMEFRAME_SECONDS,
+                    page_size * TIMEFRAME_SECONDS,
+                    anchor,
+                )
+            except Exception as e:
+                print(f"{log_prefix} history {asset}: page {i} failed: {e}")
+                continue
+
+            if not page:
+                print(f"{log_prefix} history {asset}: page {i} empty")
+                continue
+
+            parsed = []
+            for c in page:
+                try:
+                    parsed.append((
+                        int(c["time"]),
+                        float(c["open"]),
+                        float(c["high"]),
+                        float(c["low"]),
+                        float(c["close"]),
+                    ))
+                except Exception:
+                    continue
+            total = parsed + total
+            await asyncio.sleep(0.2)
+
+        # Deduplicate by timestamp and sort
+        seen = set()
+        deduped = []
+        for c in total:
+            if c[0] not in seen:
+                seen.add(c[0])
+                deduped.append(c)
+        deduped.sort(key=lambda x: x[0])
+
+        # Keep only the last HISTORY_CANDLES
+        deduped = deduped[-HISTORY_CANDLES:]
+
+        print(f"{log_prefix} history {asset}: fetched {len(deduped)} candles")
+
+        with self.state_lock:
+            if not deduped:
+                state.history_loaded = True
+                return
+
+            # Prepend history to the current buffer
+            current = list(state.candles)
+            current_min = current[0][0] if current else None
+
+            # Filter history to only what's older than the current oldest live candle
+            if current_min is not None:
+                history_to_prepend = [c for c in deduped if c[0] < current_min]
+            else:
+                history_to_prepend = deduped
+
+            combined = history_to_prepend + current
+            combined = combined[-MAX_CANDLES:]
+            state.candles = deque(combined, maxlen=MAX_CANDLES)
+            state.history_count = len(history_to_prepend)
+            state.history_loaded = True
+
+            # Recompute indicators
+            closes = [c[4] for c in state.candles]
+            if state.forming:
+                closes.append(state.forming["close"])
+            if closes:
+                self._apply_indicators(state, closes)
+
+        print(f"{log_prefix} history {asset}: prepended {len(history_to_prepend)} candles, "
+              f"total {len(state.candles)}")
 
     async def _ingest_loop(self, asset: str, stream):
         state = self.asset_state[asset]
