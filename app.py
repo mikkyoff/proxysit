@@ -48,7 +48,7 @@ PROXY_URL = _build_proxy(
 # Slot config — one slot, one asset
 # ---------------------------------------------------------------------
 SSID = os.getenv("SSID", "")
-ASSET = os.getenv("ASSET", "EURUSD_otc")
+ASSET = os.getenv("ASSET", "GBPAUD_otc")
 
 SLOTS_CONFIG = [
     (SSID, [ASSET], "ticks", PROXY_URL),
