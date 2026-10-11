@@ -1,18 +1,5 @@
 """
-Multi-SSID streaming manager — boundary-first, history-after.
-
-Flow per slot:
-  1. Connect to PocketOption (with optional proxy).
-  2. Subscribe to tick streams immediately.
-  3. Wait for the next clean 60s boundary.
-  4. Discard ticks until the boundary.
-  5. At the boundary:
-       - Flip aligned_started = True.
-       - The next tick is the true open of the live candle.
-       - Spawn a background task to pull 150 closed candles.
-  6. When history arrives, prepend it to the candle buffer and
-     recompute indicators on the combined series.
-  7. Continue building live candles every minute.
+Multi-SSID streaming manager — boundary-first, live-tick-first, history-after.
 """
 
 import asyncio
@@ -30,8 +17,8 @@ from perf import SlotStats, AssetStats
 
 
 TIMEFRAME_SECONDS = 60
-MAX_CANDLES = 500                # enough for 150 seeded + live
-HISTORY_CANDLES = 150            # how many closed candles to pull for seeding
+MAX_CANDLES = 500
+HISTORY_CANDLES = 150
 
 RSI_PERIOD = 14
 BB_PERIOD = 20
@@ -50,11 +37,12 @@ class AssetState:
         "ema", "ema_signal",
         "aligned_started", "aligned_at",
         "history_loaded", "history_count",
+        "first_live_tick_seen",
     )
 
     def __init__(self, asset: str):
         self.asset = asset
-        self.candles = deque(maxlen=MAX_CANDLES)   # tuples (t, o, h, l, c)
+        self.candles = deque(maxlen=MAX_CANDLES)
         self.forming = None
         self.last_boundary = None
 
@@ -72,6 +60,7 @@ class AssetState:
         self.aligned_at = None
         self.history_loaded = False
         self.history_count = 0
+        self.first_live_tick_seen = False
 
     def snapshot(self):
         return {
@@ -80,6 +69,7 @@ class AssetState:
             "aligned_at": self.aligned_at,
             "history_loaded": self.history_loaded,
             "history_count": self.history_count,
+            "first_live_tick_seen": self.first_live_tick_seen,
             "closed_count": len(self.candles),
             "candles": [
                 {"time": t, "open": o, "high": h, "low": l, "close": c}
@@ -168,12 +158,10 @@ class Slot:
         )
         self.stats.mark_connected()
 
-        # ---- Compute target boundary ----
         target_boundary = self._compute_target_boundary()
         wait_secs = target_boundary - time.time()
         print(f"[slot {self.slot_id}] waiting {wait_secs:.1f}s for boundary at {int(target_boundary)}")
 
-        # ---- Subscribe BEFORE the boundary ----
         streams = {}
         for asset in self.assets:
             try:
@@ -182,7 +170,6 @@ class Slot:
                 self.stats.mark_error(f"subscribe {asset}: {e}")
                 print(f"[slot {self.slot_id}] subscribe {asset} failed: {e}")
 
-        # ---- Discard ticks until boundary ----
         discard_deadline = target_boundary
 
         async def discard_stream(stream):
@@ -201,26 +188,39 @@ class Slot:
             return_exceptions=True,
         )
 
-        # ---- Cross the boundary ----
         now = int(time.time())
-        print(f"[slot {self.slot_id}] boundary crossed at {now} — starting live build")
+        print(f"[slot {self.slot_id}] boundary crossed at {now}")
         with self.state_lock:
             for st in self.asset_state.values():
                 st.aligned_started = True
                 st.aligned_at = now
                 st.forming = None
 
-        # ---- Spawn history fetch in background ----
-        for asset in self.assets:
-            asyncio.create_task(self._fetch_history(client, asset))
+        # Start ingest loops FIRST, then wait for the first live tick
+        ingest_tasks = []
+        for asset, stream in streams.items():
+            ingest_tasks.append(
+                asyncio.create_task(self._ingest_loop(asset, stream))
+            )
 
-        # ---- Live ingest ----
-        tasks = [
-            asyncio.create_task(self._ingest_loop(asset, stream))
-            for asset, stream in streams.items()
+        # Wait for each asset's first live tick (up to 20s) before pulling history
+        for asset in self.assets:
+            state = self.asset_state[asset]
+            for _ in range(200):  # up to 20 seconds
+                with self.state_lock:
+                    if state.first_live_tick_seen:
+                        break
+                await asyncio.sleep(0.1)
+            print(f"[slot {self.slot_id}] {asset}: first_live_tick_seen={state.first_live_tick_seen}")
+
+        # Now pull history in parallel
+        history_tasks = [
+            asyncio.create_task(self._fetch_history(client, asset))
+            for asset in self.assets
         ]
+
         try:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*ingest_tasks, *history_tasks, return_exceptions=True)
         finally:
             self.stats.mark_disconnected("stream loop ended")
             try:
@@ -236,10 +236,6 @@ class Slot:
         return float(next_boundary)
 
     async def _fetch_history(self, client, asset: str):
-        """
-        Pull the last HISTORY_CANDLES closed candles using the
-        developer's paged walk. Runs in background after the boundary.
-        """
         state = self.asset_state[asset]
         log_prefix = f"[slot {self.slot_id}]"
 
@@ -256,7 +252,6 @@ class Slot:
         pages = (HISTORY_CANDLES + page_size - 1) // page_size
 
         for i in range(pages):
-            # Walk backward: anchor at server_time, stepping back each page
             anchor = server_time - (i + 1) * page_size * TIMEFRAME_SECONDS
             if anchor < 0:
                 break
@@ -288,9 +283,9 @@ class Slot:
                 except Exception:
                     continue
             total = parsed + total
+            print(f"{log_prefix} history {asset}: page {i} got {len(parsed)}")
             await asyncio.sleep(0.2)
 
-        # Deduplicate by timestamp and sort
         seen = set()
         deduped = []
         for c in total:
@@ -298,26 +293,27 @@ class Slot:
                 seen.add(c[0])
                 deduped.append(c)
         deduped.sort(key=lambda x: x[0])
-
-        # Keep only the last HISTORY_CANDLES
         deduped = deduped[-HISTORY_CANDLES:]
 
-        print(f"{log_prefix} history {asset}: fetched {len(deduped)} candles")
+        print(f"{log_prefix} history {asset}: deduped={len(deduped)}")
 
         with self.state_lock:
             if not deduped:
                 state.history_loaded = True
+                print(f"{log_prefix} history {asset}: NO CANDLES")
                 return
 
-            # Prepend history to the current buffer
             current = list(state.candles)
-            current_min = current[0][0] if current else None
-
-            # Filter history to only what's older than the current oldest live candle
-            if current_min is not None:
-                history_to_prepend = [c for c in deduped if c[0] < current_min]
+            # The forming candle's bucket is the cutoff. Anything older than
+            # the forming candle's start is valid history to prepend.
+            if state.forming is not None:
+                cutoff = state.forming["time"]
+            elif current:
+                cutoff = current[0][0]
             else:
-                history_to_prepend = deduped
+                cutoff = server_time
+
+            history_to_prepend = [c for c in deduped if c[0] < cutoff]
 
             combined = history_to_prepend + current
             combined = combined[-MAX_CANDLES:]
@@ -325,15 +321,16 @@ class Slot:
             state.history_count = len(history_to_prepend)
             state.history_loaded = True
 
-            # Recompute indicators
             closes = [c[4] for c in state.candles]
             if state.forming:
                 closes.append(state.forming["close"])
             if closes:
                 self._apply_indicators(state, closes)
 
-        print(f"{log_prefix} history {asset}: prepended {len(history_to_prepend)} candles, "
-              f"total {len(state.candles)}")
+        print(
+            f"{log_prefix} history {asset}: prepended {len(history_to_prepend)}, "
+            f"cutoff={cutoff}, total={len(state.candles)}"
+        )
 
     async def _ingest_loop(self, asset: str, stream):
         state = self.asset_state[asset]
@@ -374,6 +371,7 @@ class Slot:
                     "open": price, "high": price, "low": price, "close": price,
                 }
                 state.last_boundary = bucket
+                state.first_live_tick_seen = True
             elif bucket > state.last_boundary:
                 gap_buckets = (bucket - state.last_boundary) // TIMEFRAME_SECONDS - 1
                 if gap_buckets > 0:
