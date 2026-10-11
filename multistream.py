@@ -27,7 +27,7 @@ from perf import SlotStats, AssetStats
 from seeder import seed_history
 
 
-TIMEFRAME_SECONDS = 60
+TIMEFRAME_SECONDS = 10
 MAX_CANDLES = 2400          # allow the full seed to live in memory
 RSI_PERIOD = 14
 BB_PERIOD = 20
